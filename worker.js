@@ -68,15 +68,14 @@ const refreshAccessToken = async (domain, hubId, tryCount) => {
  * @param domain
  * @param hubId
  * @param ownerId
- * @returns Promise<PublicOwner>
+ * @returns Promise<PublicOwner | null>
  */
 const getOwnerById = async (domain, hubId, ownerId) => {
-  // Check cached owners first and confirm valid email
-  if (ownersCache[ownerId] && ownersCache[ownerId].email) {
-    return ownersCache[ownerId]
-  }
+  if (isNaN(ownerId)) return null
+  // Check cached owners first
+  if (ownersCache[ownerId]) return ownersCache[ownerId]
 
-  let searchResult = {};
+  let searchResult = null;
 
   let tryCount = 0;
   while (tryCount <= 4) {
@@ -87,9 +86,25 @@ const getOwnerById = async (domain, hubId, ownerId) => {
     } catch (err) {
       tryCount++;
 
+      if (tryCount === 4) {
+        /**
+         * When OwnerId doest not seems to exist, this prevents unnecessary calls to Hubspot API
+         */
+        if (typeof err?.message === "string" && err.message.includes('Resource not found')) {
+          ownersCache[ownerId] = {
+            email: null
+          }
+        }
+        console.error('getOwnerId failed', {ownerId, errorMessage: err?.message, tryCount})
+        break
+      }
+
       if (new Date() > expirationDate) await refreshAccessToken(domain, hubId);
 
-      await new Promise((resolve, reject) => setTimeout(resolve, 5000 * Math.pow(2, tryCount)));
+      const timeoutMS = 1000 * Math.pow(2, tryCount)
+      console.warn('Retrying getOwnerId due to error', {ownerId, errorMessage: err?.message, tryCount, timeoutMS})
+
+      await new Promise((resolve, reject) => setTimeout(resolve, timeoutMS));
     }
   }
 
@@ -309,8 +324,6 @@ const processContacts = async (domain, hubId, q) => {
  * @param hubId
  * @param q
  * @returns {Promise<boolean>}
- *
- *
  */
 const processMeetings = async (domain, hubId, q) => {
   const account = domain.integrations.hubspot.accounts.find(account => account.hubId === hubId);
@@ -371,15 +384,14 @@ const processMeetings = async (domain, hubId, q) => {
     for (const meeting of data) {
       if (!meeting.properties) {
         console.error({warn: 'Meeting without properties found', meetingId: meeting.id})
-        return
-      }
-
-      if (!meeting.properties.hubspot_owner_id) {
-        console.warn({warn: 'Meeting without ownerId found', meetingId: meeting.id})
-        return
+        continue
       }
 
       const owner = await getOwnerById(domain, hubId, meeting.properties.hubspot_owner_id)
+
+      if (!owner?.email) {
+        console.warn('Unable to find owner of meeting', {meeting_owner_id: meeting.properties.hubspot_owner_id, meeting_id: meeting.id})
+      }
 
       const actionTemplate = {
         includeInAnalytics: 0,
@@ -388,7 +400,7 @@ const processMeetings = async (domain, hubId, q) => {
           meeting_timestamp: meeting.properties.hs_timestamp,
           meeting_title: meeting.properties.hs_meeting_title,
           meeting_owner_id: meeting.properties.hubspot_owner_id,
-          meeting_owner_email: owner.email,
+          meeting_owner_email: owner?.email,
           meeting_body: meeting.properties.hs_meeting_body,
           meeting_internal_notes: meeting.properties.hs_internal_meeting_notes,
           meeting_external_url: meeting.properties.hs_meeting_external_url,
@@ -456,7 +468,6 @@ const pullDataFromHubspot = async () => {
   console.log('start pulling data from HubSpot');
 
   const domain = await Domain.findOne({});
-
   for (const account of domain.integrations.hubspot.accounts) {
     console.log('start processing account');
 
